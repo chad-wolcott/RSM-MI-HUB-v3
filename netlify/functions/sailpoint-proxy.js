@@ -226,115 +226,184 @@ async function getIdentityCount(tenantUrl, accessToken) {
 }
 
 // ── Action: get-va-clusters ───────────────────────────────────────────────────
-// Endpoint:  GET /v2026/managed-clusters
-//            No experimental header required.  Returns all clusters for the org.
 //
-// VA cluster health:
-//   The cluster-level health comes from the `health` object on each cluster record,
-//   specifically `health.healthy` (boolean) and `health.status` (string).
-//   The VA cluster status-change event trigger confirms statuses of "Succeeded"
-//   (healthy) and "Failed" (unhealthy) at the cluster level via healthCheckResult.
+// Strategy (two independent approaches tried in order):
 //
-// Type filtering:
-//   Only include clusters where type === 'VA'.  CCG / SaaS clusters have
-//   type === 'CCG' or no VAs at all — exclude them so counts stay accurate.
+// ① GET /v2026/managed-clusters  →  GET /v3/managed-clusters
+//    Returns an array of cluster objects.  Each cluster's `type` field can be:
+//      - A string:  "VA", "CCG", etc.           (v3 / older API shape)
+//      - An object: { id, name, clusterType }   (v2026 shape — Managed Cluster Types)
+//    We log the FULL first cluster object so the actual shape is visible in
+//    Netlify function logs, making future debugging straightforward.
 //
-// Fallback chain:
-//   v2026  →  v3  (some orgs lag behind API versions; both endpoints are identical
-//   in structure so the same parsing logic works for both)
+// ② GET /v2026/managed-clients  (fallback)
+//    Returns individual VA client records.  Each has:
+//      clusterId            — links back to the cluster
+//      clientStatus.status  — 'NORMAL' | 'ERROR' | 'WARNING' | 'CONFIGURING'
+//    We group by clusterId to derive cluster count and per-cluster health.
+//    This approach is always available regardless of cluster type filtering.
+//
+// Both paths surface diagnostic notes back to the caller so the UI can
+// show "refresh to load" rather than silently showing 0.
 async function getVaClusters(tenantUrl, accessToken) {
   const apiBase = getApiBase(tenantUrl)
   const headers = { Authorization: `Bearer ${accessToken}`, Accept: 'application/json' }
 
-  // Try v2026 first, fall back to v3 for orgs not yet on the latest version
-  let body = null
-  for (const version of ['v2026', 'v3']) {
-    const res = await httpRequest(`${apiBase}/${version}/managed-clusters`, {
-      headers,
-      timeout: 12000,
-    })
-    if (res.status === 200) {
-      body = res.body
-      console.log(`[getVaClusters] /${version}/managed-clusters succeeded`)
-      break
+  // ── Helper: resolve the type value from a cluster record ──────────────────
+  // In v3 the type is a plain string; in v2026 it may be an object reference
+  // to a Managed Cluster Type record.
+  function clusterTypeName(c) {
+    if (!c.type) return ''
+    if (typeof c.type === 'string') return c.type.toUpperCase()
+    // v2026 object: { id, name, clusterType }
+    if (typeof c.type === 'object') {
+      return (c.type.name || c.type.clusterType || '').toUpperCase()
     }
-    console.warn(`[getVaClusters] /${version}/managed-clusters returned HTTP ${res.status}`)
+    return ''
   }
 
-  if (!body) {
-    return { vaCount: 0, unhealthyCount: 0, clusters: [], note: 'Both v2026 and v3 failed' }
+  // ── Helper: is this cluster a VA cluster? ─────────────────────────────────
+  // Accept 'VA' type.  If type is absent, conservatively include it — the cluster
+  // list endpoint often only returns VA clusters for the calling org anyway.
+  function isVaCluster(c) {
+    const t = clusterTypeName(c)
+    if (!t) return true      // type not set — include by default
+    if (t === 'VA') return true
+    // Exclude known non-VA types explicitly
+    return !['CCG', 'SAAS', 'PROXY'].includes(t)
   }
 
-  const allClusters = JSON.parse(body)
-
-  // Log raw shape of first cluster to help diagnose health field issues
-  if (allClusters.length > 0) {
-    const sample = allClusters[0]
-    console.log('[getVaClusters] Sample cluster keys:', Object.keys(sample).join(', '))
-    if (sample.health !== undefined) {
-      console.log('[getVaClusters] sample.health:', JSON.stringify(sample.health))
+  // ── Helper: derive readable status from a cluster record ──────────────────
+  function clusterStatus(c) {
+    // v3 shape: clientStatus.status === 'NORMAL' means healthy
+    if (c.clientStatus?.status) {
+      const s = c.clientStatus.status.toUpperCase()
+      return s === 'NORMAL' ? 'CONNECTED' : s
     }
-    if (sample.clientStatus !== undefined) {
-      console.log('[getVaClusters] sample.clientStatus:', JSON.stringify(sample.clientStatus))
-    }
-  }
-
-  // Filter to VA clusters only — type 'VA' (upper or lower case)
-  // Exclude CCG / SaaS proxy clusters (type 'CCG') and anything else
-  const vaClusters = allClusters.filter(c => {
-    const t = (c.type || '').toUpperCase()
-    return t === 'VA'
-  })
-
-  // Determine health — multiple possible shapes depending on API version:
-  //
-  // Shape A (v2026 cluster list):
-  //   c.health = { healthy: true|false, status: 'HEALTHY'|'UNHEALTHY'|'FAILED', ... }
-  //
-  // Shape B (v3 cluster list):
-  //   c.clientStatus = { status: 'NORMAL'|'ERROR'|'WARNING'|'CONFIGURING' }
-  //
-  // Shape C (some tenants):
-  //   c.status = string
-  //
-  // We check all three in priority order.
-  function deriveStatus(c) {
-    // Shape A — preferred
+    // v2026 shape: health.healthy (bool) or health.status (string)
     if (c.health !== undefined) {
       if (typeof c.health.healthy === 'boolean') {
         return c.health.healthy ? 'CONNECTED' : (c.health.status || 'UNHEALTHY')
       }
-      if (typeof c.health.status === 'string') {
-        const hs = c.health.status.toUpperCase()
-        return ['HEALTHY', 'OK', 'SUCCEEDED'].includes(hs) ? 'CONNECTED' : hs
+      if (c.health.status) {
+        const s = c.health.status.toUpperCase()
+        return ['HEALTHY','OK','SUCCEEDED','NORMAL'].includes(s) ? 'CONNECTED' : s
       }
     }
-    // Shape B — v3 clientStatus
-    if (c.clientStatus?.status) {
-      const cs = c.clientStatus.status.toUpperCase()
-      return cs === 'NORMAL' ? 'CONNECTED' : cs
-    }
-    // Shape C — top-level status string
+    // Fallback: top-level status string
     if (c.status) {
-      const st = c.status.toUpperCase()
-      return ['HEALTHY', 'NORMAL', 'ACTIVE', 'CONNECTED', 'SUCCEEDED'].includes(st)
-        ? 'CONNECTED' : st
+      const s = c.status.toUpperCase()
+      return ['HEALTHY','NORMAL','ACTIVE','CONNECTED','OK'].includes(s) ? 'CONNECTED' : s
     }
-    // Unknown — assume healthy (don't penalise tenants with partial data)
-    return 'CONNECTED'
+    return 'CONNECTED'  // unknown — assume healthy
   }
 
-  const enriched = vaClusters.map(c => ({
-    id:     c.id,
-    name:   c.name || c.id,
-    type:   'VA',
-    status: deriveStatus(c),
-  }))
+  // ── Strategy 1: managed-clusters list ────────────────────────────────────
+  for (const version of ['v2026', 'v3']) {
+    let res
+    try {
+      res = await httpRequest(`${apiBase}/${version}/managed-clusters`, { headers, timeout: 12000 })
+    } catch (err) {
+      console.warn(`[getVaClusters] ${version}/managed-clusters request error: ${err.message}`)
+      continue
+    }
 
-  const vaCount    = enriched.length
-  const unhealthy  = enriched.filter(c => c.status !== 'CONNECTED').length
+    console.log(`[getVaClusters] ${version}/managed-clusters → HTTP ${res.status}`)
 
-  return { vaCount, unhealthyCount: unhealthy, clusters: enriched }
+    if (res.status !== 200) {
+      // Log error body to help diagnose 403 / 401 permission issues
+      console.warn(`[getVaClusters] ${version} error body: ${res.body.slice(0, 500)}`)
+      continue
+    }
+
+    let allClusters
+    try { allClusters = JSON.parse(res.body) } catch { continue }
+
+    if (!Array.isArray(allClusters)) {
+      console.warn(`[getVaClusters] ${version} response is not an array:`, typeof allClusters)
+      continue
+    }
+
+    console.log(`[getVaClusters] ${version} returned ${allClusters.length} cluster(s) total`)
+
+    // Log the FULL first cluster so we can see the exact schema in function logs
+    if (allClusters.length > 0) {
+      console.log('[getVaClusters] First cluster (full):', JSON.stringify(allClusters[0]).slice(0, 1000))
+    }
+
+    const vaClusters = allClusters.filter(isVaCluster)
+    console.log(`[getVaClusters] ${vaClusters.length} VA cluster(s) after type filter`)
+
+    if (vaClusters.length > 0 || allClusters.length === 0) {
+      // We got a valid response (even if 0 clusters — org genuinely has none)
+      const enriched = vaClusters.map(c => ({
+        id:     c.id,
+        name:   c.name || c.id,
+        type:   clusterTypeName(c) || 'VA',
+        status: clusterStatus(c),
+      }))
+      const unhealthy = enriched.filter(c => c.status !== 'CONNECTED').length
+      return { vaCount: enriched.length, unhealthyCount: unhealthy, clusters: enriched }
+    }
+
+    // Got clusters but type filter excluded all of them — fall through to strategy 2
+    console.warn('[getVaClusters] All clusters excluded by type filter — trying managed-clients')
+    break
+  }
+
+  // ── Strategy 2: managed-clients (individual VA nodes) ────────────────────
+  // Groups by clusterId to reconstruct cluster-level counts.
+  // clientStatus.status === 'NORMAL' = healthy VA node; anything else = unhealthy.
+  console.log('[getVaClusters] Attempting strategy 2: managed-clients')
+  try {
+    const res = await httpRequest(`${apiBase}/v2026/managed-clients`, { headers, timeout: 12000 })
+    console.log(`[getVaClusters] v2026/managed-clients → HTTP ${res.status}`)
+
+    if (res.status === 200) {
+      const clients = JSON.parse(res.body)
+      if (!Array.isArray(clients)) {
+        console.warn('[getVaClusters] managed-clients response not an array')
+        return { vaCount: 0, unhealthyCount: 0, clusters: [], note: 'managed-clients not an array' }
+      }
+
+      console.log(`[getVaClusters] managed-clients returned ${clients.length} client(s)`)
+      if (clients.length > 0) {
+        console.log('[getVaClusters] First client (full):', JSON.stringify(clients[0]).slice(0, 800))
+      }
+
+      // Group clients by cluster
+      const clusterMap = new Map()
+      for (const client of clients) {
+        const cid = client.clusterId || client.cluster?.id || 'unknown'
+        const cname = client.clusterName || client.cluster?.name || cid
+        const isHealthy = (client.clientStatus?.status || '').toUpperCase() === 'NORMAL'
+
+        if (!clusterMap.has(cid)) {
+          clusterMap.set(cid, { id: cid, name: cname, totalClients: 0, unhealthyClients: 0 })
+        }
+        const entry = clusterMap.get(cid)
+        entry.totalClients++
+        if (!isHealthy) entry.unhealthyClients++
+      }
+
+      const clusters = Array.from(clusterMap.values()).map(c => ({
+        id:     c.id,
+        name:   c.name,
+        type:   'VA',
+        status: c.unhealthyClients === 0 ? 'CONNECTED' : `${c.unhealthyClients}/${c.totalClients} unhealthy`,
+      }))
+      const unhealthy = clusters.filter(c => c.status !== 'CONNECTED').length
+
+      return { vaCount: clusters.length, unhealthyCount: unhealthy, clusters }
+    }
+
+    console.warn(`[getVaClusters] managed-clients HTTP ${res.status}: ${res.body.slice(0, 400)}`)
+  } catch (err) {
+    console.warn(`[getVaClusters] managed-clients error: ${err.message}`)
+  }
+
+  // Both strategies failed — non-fatal, return empty
+  return { vaCount: 0, unhealthyCount: 0, clusters: [], note: 'Both strategies failed — check function logs for HTTP status and error body' }
 }
 
 // ── Action: full-validation ───────────────────────────────────────────────────
@@ -436,8 +505,10 @@ async function fullValidation(tenantUrl, clientId, clientSecret) {
     steps.push({
       id: 'va',
       label: 'Virtual Appliance Clusters',
-      status: 'pass',
-      detail: `${vaInfo.vaCount} cluster(s) found${vaInfo.unhealthyCount > 0 ? ` — ${vaInfo.unhealthyCount} unhealthy` : ''}`,
+      status: vaInfo.note ? 'warn' : 'pass',
+      detail: vaInfo.note
+        ? `VA check non-fatal: ${vaInfo.note}`
+        : `${vaInfo.vaCount} cluster(s) found${vaInfo.unhealthyCount > 0 ? ` — ${vaInfo.unhealthyCount} unhealthy` : ''}`,
     })
   } catch (err) {
     steps.push({ id: 'va', label: 'Virtual Appliance Clusters', status: 'warn', detail: `Non-fatal: ${err.message}` })
